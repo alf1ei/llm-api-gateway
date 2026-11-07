@@ -1,92 +1,115 @@
 # LLM API Gateway
 
-[简体中文](#简体中文) | [English](#english)
+[简体中文](#简体中文) · [English](#english)
+
+A self-hosted, OpenAI-compatible gateway for routing chat-completion requests to multiple configured model providers. One client key, server-side provider credentials, model allowlists, and SQLite usage records.
 
 ## 简体中文
 
-一个轻量级、多模型统一 API 网关。客户端使用统一的 OpenAI-compatible 接口，通过 `provider:model` 选择上游模型；网关负责鉴权、转发和记录基础用量。
-
-### 功能
-- OpenAI-compatible `POST /v1/chat/completions`
-- `GET /v1/models` 列出已配置模型
-- 多 Provider 配置：DeepSeek、OpenAI 或其他兼容接口
-- 网关 Bearer Key 鉴权，上游密钥仅保存在服务端
-- SQLite 请求记录：状态码、Token 用量、延迟
-- Docker 与 GitHub Actions 测试工作流
+### 当前能力
+- 统一接口：`POST /v1/chat/completions`，兼容 OpenAI Chat Completions 请求结构
+- 模型发现：`GET /v1/models`，使用 `provider:model` 指定上游
+- 多供应商：DeepSeek、OpenAI 及其他兼容 OpenAI API 的服务
+- 网关 Bearer Key 鉴权，恒定时间比较；未配置强密钥时拒绝服务
+- Provider 模型白名单，避免客户端任意请求未配置模型
+- 上游超时、网络错误和非 JSON 响应的安全处理
+- 复用异步 HTTP 连接池；记录状态码、Token 用量和延迟
+- SQLite 使用记录：`GET /admin/usage?limit=100`
+- Docker Compose、OpenAPI 文档、Python 3.11–3.13 CI
 
 ### 快速开始
+要求 Python 3.11+。
+
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+source .venv/bin/activate
+pip install -e ".[dev]"
 cp .env.example .env
-# 编辑 .env：设置 GATEWAY_API_KEY 和 PROVIDERS_JSON 中的上游密钥
-uvicorn app.main:app --reload
 ```
 
-访问 `http://localhost:8000/docs` 查看 API 文档。
+编辑 `.env`，设置随机网关密钥和上游凭据：
 
-### 调用示例
+```dotenv
+GATEWAY_API_KEY=replace-with-a-long-random-secret
+DATABASE_URL=sqlite:///./gateway.db
+REQUEST_TIMEOUT=60
+PROVIDERS_JSON={"default_provider":"deepseek","deepseek":{"base_url":"https://api.deepseek.com/v1","api_key":"YOUR_DEEPSEEK_KEY","models":["deepseek-chat"]}}
+```
+
+启动：`uvicorn app.main:app --host 127.0.0.1 --port 8000`
+
+- 健康检查：`GET /health`
+- API 文档：`/docs`
+
+### 请求示例
 ```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Authorization: Bearer replace-with-a-long-random-secret" \
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $GATEWAY_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "deepseek:deepseek-chat",
-    "messages": [{"role": "user", "content": "Explain API gateways briefly."}]
-  }'
+  -d '{"model":"deepseek:deepseek-chat","messages":[{"role":"user","content":"你好"}]}'
 ```
 
-### 配置 Provider
-`PROVIDERS_JSON` 是 JSON 对象。每个 Provider 至少需要 `base_url`、`api_key`，可选 `models`。模型名格式为 `provider:model-name`。不带前缀时使用 `default_provider`。
+不带 `provider:` 前缀时使用 `default_provider`。Provider 配置了 `models` 白名单时，只允许调用白名单内的模型。
+
+### API
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/health` | No | 健康检查 |
+| GET | `/v1/models` | Yes | 已配置模型列表 |
+| POST | `/v1/chat/completions` | Yes | 转发聊天请求 |
+| GET | `/admin/usage?limit=100` | Yes | 最近用量记录，limit 为 1–1000 |
+| GET | `/docs` | No | OpenAPI / Swagger UI |
+
+### Docker 部署
+```bash
+cp .env.example .env
+# 编辑 .env 后
+docker compose up --build -d
+```
+
+默认监听 8000，数据库持久化到 Docker volume。建议将服务放在 HTTPS 反向代理之后，不要直接将管理接口暴露到公网。
+
+### 安全边界与限制
+- Provider URL 只能来自服务端配置；仅允许 HTTPS（本机回环地址可使用 HTTP），并拒绝私有/保留 IP，降低 SSRF 风险。
+- 不要提交 `.env`、上游密钥或真实用户请求日志。
+- 当前是单网关密钥、单实例 MVP；尚无多租户、用户配额、计费、流式 SSE、自动故障切换或完整管理 UI。
+- SQLite 适用于单实例和轻量使用；高并发/多副本部署应迁移到 PostgreSQL，并补充分布式限流与租户隔离。
+- 模型输出和上游错误仍应由调用方按业务需要校验。
 
 ### 测试
 ```bash
 pytest -q
+python -m compileall -q app tests
 ```
-
-### 部署
-```bash
-cp .env.example .env
-# 编辑 .env 后：
-docker compose up --build -d
-```
-
-生产环境请使用强随机网关密钥、HTTPS、反向代理和受限网络策略。当前版本是单实例 MVP，不包含用户/团队配额、流式转发、复杂计费或管理后台。
-
-### 安全说明
-- 不要提交 `.env` 或真实 API Key。
-- 仅配置可信上游地址；不要把 Provider URL 暴露给不可信用户控制。
-- 建议在公网部署前增加速率限制、IP allowlist、审计与密钥轮换。
 
 ## English
 
-A lightweight multi-provider gateway exposing an OpenAI-compatible chat completions endpoint. Clients authenticate once against the gateway and select an upstream model with `provider:model`.
-
 ### Features
-- OpenAI-compatible `POST /v1/chat/completions`
-- Configured model discovery via `GET /v1/models`
-- Multiple OpenAI-compatible upstream providers
-- Gateway Bearer authentication; upstream keys remain server-side
-- SQLite usage records for status, token counts, and latency
-- Docker packaging and GitHub Actions CI
+- OpenAI-compatible `POST /v1/chat/completions` and authenticated `GET /v1/models`
+- Multiple configured upstream providers selected with `provider:model`
+- Gateway Bearer authentication with constant-time key comparison
+- Optional per-provider model allowlists
+- Reused async HTTP connection pool and configurable timeout
+- Safe upstream timeout/network/non-JSON error handling
+- SQLite usage tracking for status, token counts, and latency
+- Docker Compose, OpenAPI docs, and CI across Python 3.11–3.13
 
 ### Quick start
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 cp .env.example .env
-# Set GATEWAY_API_KEY and upstream credentials in PROVIDERS_JSON
-uvicorn app.main:app --reload
+# Set GATEWAY_API_KEY and PROVIDERS_JSON in .env
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://localhost:8000/docs`.
+### API
+- `GET /health` — health check
+- `GET /v1/models` — configured models (Bearer auth)
+- `POST /v1/chat/completions` — chat completion proxy (Bearer auth)
+- `GET /admin/usage?limit=100` — usage records (Bearer auth)
+- `GET /docs` — interactive OpenAPI documentation
 
-### Test and deploy
-```bash
-pytest -q
-docker compose up --build -d
-```
-
-This is an MVP intended for trusted/private deployments. Streaming, quotas, billing, rate limiting, and a full admin UI are out of scope for this iteration.
+### Security notes
+Keep provider credentials in server-side environment configuration. Only HTTPS provider URLs are accepted, except HTTP loopback for local development. Add TLS termination, rate limiting, tenant isolation, and a stronger persistent database before public or multi-user deployment.
